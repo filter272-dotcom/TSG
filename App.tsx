@@ -1,202 +1,89 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
-*/
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import './index.css';
 
-import React, { useState, useCallback } from 'react';
-import Header from './components/Header';
-import StartScreen from './components/StartScreen';
-import EditorCanvas from './components/EditorCanvas';
-import Toolbar from './components/Toolbar';
-import ImprovementsPanel from './components/ImprovementsPanel';
-import CropPanel from './components/CropPanel';
-import { editImageWithGemini } from './services/geminiService';
-import { Tool } from './types';
-import Spinner from './components/Spinner';
-import { CheckIcon, TrashIcon } from './components/icons';
-
-type Point = { x: number; y: number; };
+type GameStatus = 'ready' | 'playing' | 'gameover';
+type Obstacle = { id: number; lane: number; y: number };
+const LANES = [22, 50, 78];
 
 const App: React.FC = () => {
-  const [originalImage, setOriginalImage] = useState<string | null>(null);
-  const [currentImage, setCurrentImage] = useState<string | null>(null);
-  const [activeTool, setActiveTool] = useState<Tool | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-  const [isCropping, setIsCropping] = useState<boolean>(false);
-  const [cropAspect, setCropAspect] = useState<number | undefined>(undefined);
-  const [cropTrigger, setCropTrigger] = useState(0);
-  const [polygonPoints, setPolygonPoints] = useState<Point[]>([]);
-  const [isPolygonClosed, setIsPolygonClosed] = useState<boolean>(false);
+  const [status, setStatus] = useState<GameStatus>('ready');
+  const [lane, setLane] = useState(1);
+  const [obstacles, setObstacles] = useState<Obstacle[]>([]);
+  const [score, setScore] = useState(0);
+  const [best, setBest] = useState(() => Number(localStorage.getItem('neon-run-best') || 0));
+  const [charge, setCharge] = useState(100);
+  const game = useRef({ lane: 1, score: 0, nextId: 0, lastSpawn: 0, lastTime: 0 });
+  const touchStart = useRef<number | null>(null);
 
-  const handleFileSelect = (files: FileList | null) => {
-    if (files && files[0]) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const imageDataUrl = e.target?.result as string;
-        setOriginalImage(imageDataUrl);
-        setCurrentImage(imageDataUrl);
-        setActiveTool('improvements');
-      };
-      reader.readAsDataURL(files[0]);
-    }
-  };
-  
-  const resetPolygon = () => {
-    setPolygonPoints([]);
-    setIsPolygonClosed(false);
-  };
+  const move = useCallback((direction: -1 | 1) => {
+    if (status !== 'playing') return;
+    setLane(current => {
+      const next = Math.max(0, Math.min(2, current + direction));
+      game.current.lane = next;
+      return next;
+    });
+  }, [status]);
 
-  const handleApplyImprovement = useCallback(async (prompt: string, referenceImageUrl?: string | null) => {
-    if (!currentImage) return;
+  const startGame = useCallback(() => {
+    game.current = { lane: 1, score: 0, nextId: 0, lastSpawn: 0, lastTime: 0 };
+    setLane(1); setScore(0); setCharge(100); setObstacles([]); setStatus('playing');
+  }, []);
 
-    if (activeTool === 'improvements' && !isPolygonClosed) {
-        setError('Пожалуйста, выделите область и замкните контур.');
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowLeft' || event.key === 'a') move(-1);
+      if (event.key === 'ArrowRight' || event.key === 'd') move(1);
+      if ((event.key === ' ' || event.key === 'Enter') && status !== 'playing') startGame();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [move, startGame, status]);
+
+  useEffect(() => {
+    if (status !== 'playing') return;
+    let frame = 0;
+    const tick = (now: number) => {
+      const state = game.current;
+      if (!state.lastTime) state.lastTime = now;
+      const elapsed = Math.min(now - state.lastTime, 45);
+      state.lastTime = now;
+      const speed = 0.028 + Math.min(state.score / 80000, 0.014);
+      if (now - state.lastSpawn > Math.max(520, 1050 - state.score / 55)) {
+        state.lastSpawn = now;
+        setObstacles(items => [...items, { id: ++state.nextId, lane: Math.floor(Math.random() * 3), y: -12 }]);
+      }
+      let hit = false;
+      setObstacles(items => items.map(item => ({ ...item, y: item.y + elapsed * speed })).filter(item => {
+        if (item.lane === state.lane && item.y > 76 && item.y < 91) hit = true;
+        return item.y < 112;
+      }));
+      if (hit) {
+        setStatus('gameover');
+        setBest(current => { const next = Math.max(current, state.score); localStorage.setItem('neon-run-best', String(next)); return next; });
         return;
-    }
+      }
+      state.score += Math.round(elapsed * 0.12);
+      setScore(state.score); setCharge(Math.max(12, 100 - (state.score % 880) / 11));
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [status]);
 
-    setIsLoading(true);
-    setError(null);
-    try {
-      // FIX: The function call to `editImageWithGemini` was passing a `referenceImageUrl` which was not in the function signature. The signature in `geminiService.ts` has been updated.
-      const editedImage = await editImageWithGemini(currentImage, prompt, polygonPoints, referenceImageUrl);
-      setCurrentImage(editedImage);
-      resetPolygon();
-    } catch (e: any) {
-      setError(e.message || 'Произошла неизвестная ошибка.');
-    } finally {
-      setIsLoading(false);
-    }
-  }, [currentImage, polygonPoints, isPolygonClosed, activeTool]);
-
-  const handleApplyCrop = (croppedImageUrl: string) => {
-      setCurrentImage(croppedImageUrl);
-      setActiveTool(null);
-  };
-  
-  const handleReset = () => {
-    setCurrentImage(originalImage);
-    setActiveTool(null);
-    resetPolygon();
-    setError(null);
-  };
-
-  const handleToolSelect = (tool: Tool) => {
-    resetPolygon();
-    if (activeTool === tool) {
-      setActiveTool(null);
-    } else {
-      setActiveTool(tool);
-    }
-  };
-  
-  const handleAddPoint = (point: Point) => {
-    if (!isPolygonClosed) {
-      setPolygonPoints([...polygonPoints, point]);
-    }
-  };
-
-  const handleClosePolygon = () => {
-    if (polygonPoints.length > 2) {
-      setIsPolygonClosed(true);
-    } else {
-      setError("Для замыкания контура нужно как минимум 3 точки.");
-    }
-  };
-
-  const renderToolPanel = () => {
-    switch (activeTool) {
-      case 'improvements':
-        return <ImprovementsPanel onApplyImprovement={handleApplyImprovement} isLoading={isLoading} isRegionSelected={isPolygonClosed} />;
-      case 'crop':
-        return <CropPanel 
-          onApplyCrop={() => setCropTrigger(t => t + 1)}
-          onSetAspect={setCropAspect} 
-          isLoading={isLoading} 
-          isCropping={isCropping}
-        />;
-      default:
-        return null;
-    }
-  }
-
-  return (
-    <div className="bg-gray-900 text-white min-h-screen flex flex-col items-center antialiased font-sans">
-      <Header />
-      <main className="w-full flex-grow flex flex-col items-center justify-center p-4 md:p-8">
-        {!currentImage ? (
-          <StartScreen onFileSelect={handleFileSelect} />
-        ) : (
-          <div className="w-full max-w-7xl mx-auto flex flex-col items-center gap-6 animate-fade-in">
-            {error && (
-              <div className="bg-red-500/20 border border-red-500 text-red-300 p-3 rounded-lg w-full text-center">
-                <strong>Ошибка:</strong> {error}
-              </div>
-            )}
-            <div className="relative w-full flex justify-center items-center">
-                {isLoading && (
-                    <div className="absolute inset-0 bg-black/70 flex flex-col justify-center items-center z-20 rounded-lg backdrop-blur-sm">
-                        <Spinner />
-                        <p className="text-lg mt-4 font-semibold text-gray-300">ИИ творит магию...</p>
-                    </div>
-                )}
-                <EditorCanvas 
-                    imageUrl={currentImage} 
-                    isCropping={activeTool === 'crop'}
-                    isSelectingRegion={activeTool === 'improvements'}
-                    onCropComplete={handleApplyCrop}
-                    onCroppingChange={setIsCropping}
-                    cropAspect={cropAspect}
-                    cropTrigger={cropTrigger}
-                    polygonPoints={polygonPoints}
-                    isPolygonClosed={isPolygonClosed}
-                    onPointAdd={handleAddPoint}
-                />
-            </div>
-
-            <div className="w-full flex flex-col items-center gap-4">
-               {activeTool === 'improvements' && (
-                <div className="w-full max-w-md bg-gray-800/50 border border-gray-700 rounded-lg p-3 flex flex-col items-center gap-3 animate-fade-in backdrop-blur-sm">
-                  <p className="text-sm text-gray-400">
-                    {isPolygonClosed ? 'Область выделена. Теперь опишите ваше изменение.' : 'Нажмите на изображение, чтобы расставить точки и выделить область.'}
-                  </p>
-                  {!isPolygonClosed && (
-                    <div className="flex items-center gap-3">
-                      <button 
-                        onClick={handleClosePolygon}
-                        disabled={isLoading || polygonPoints.length < 3}
-                        className="flex items-center gap-2 bg-green-600 hover:bg-green-500 text-white font-semibold py-2 px-4 rounded-md transition-all duration-200 active:scale-95 disabled:bg-gray-600 disabled:cursor-not-allowed"
-                      >
-                        <CheckIcon className="w-5 h-5" />
-                        Замкнуть контур
-                      </button>
-                      <button
-                        onClick={resetPolygon}
-                        disabled={isLoading || polygonPoints.length === 0}
-                        className="flex items-center gap-2 bg-red-600 hover:bg-red-500 text-white font-semibold py-2 px-4 rounded-md transition-all duration-200 active:scale-95 disabled:bg-gray-600 disabled:cursor-not-allowed"
-                      >
-                        <TrashIcon className="w-5 h-5" />
-                        Очистить
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-              <Toolbar 
-                activeTool={activeTool} 
-                onToolSelect={handleToolSelect} 
-                onReset={handleReset}
-                isImageLoaded={!!currentImage}
-              />
-              <div className="w-full max-w-3xl">
-                {renderToolPanel()}
-              </div>
-            </div>
-          </div>
-        )}
-      </main>
+  return <main className="game-shell"><section className="game-card" aria-label="Neon Rush arcade game">
+    <header className="topbar"><div className="brand"><span className="brand-mark">N</span><span>NEON RUSH</span></div><button className="sound-button" aria-label="Sound enabled">◖<i /></button></header>
+    <section className="hud"><div><span>SCORE</span><strong>{String(score).padStart(5, '0')}</strong></div><div className="energy"><span>CHARGE</span><em><i style={{ width: `${charge}%` }} /></em></div><div className="best"><span>BEST</span><strong>{String(best).padStart(5, '0')}</strong></div></section>
+    <div className="game-world" onTouchStart={event => { touchStart.current = event.touches[0]?.clientX ?? null; }} onTouchEnd={event => {
+      const start = touchStart.current;
+      const end = event.changedTouches[0]?.clientX;
+      if (start !== null && end !== undefined && Math.abs(end - start) > 24) move(end > start ? 1 : -1);
+      touchStart.current = null;
+    }}><div className="city"><i /><i /><i /><i /><i /><i /><i /></div><div className="horizon" /><div className="road" />
+      {obstacles.map(item => <div className="enemy" key={item.id} style={{ left: `${LANES[item.lane]}%`, top: `${item.y}%` }}><i /><b /></div>)}
+      <div className="player" style={{ left: `${LANES[lane]}%` }}><i /><b /><em /></div>
+      {status !== 'playing' && <div className="start-overlay">{status === 'gameover' && <small>SYSTEM CRASH</small>}<h1>{status === 'ready' ? 'READY TO RUSH?' : 'RUN ENDED'}</h1><p>{status === 'ready' ? 'Dodge the blockers. Chase the neon.' : `Your score: ${String(score).padStart(5, '0')}`}</p><button onClick={startGame}>{status === 'ready' ? 'START GAME' : 'PLAY AGAIN'} <b>›</b></button></div>}
     </div>
-  );
+    <footer className="controls"><button onClick={() => move(-1)} aria-label="Move left">←</button><p>SWIPE TO MOVE<br /><span>AVOID THE BLOCKERS</span></p><button onClick={() => move(1)} aria-label="Move right">→</button></footer>
+  </section></main>;
 };
-
 export default App;
